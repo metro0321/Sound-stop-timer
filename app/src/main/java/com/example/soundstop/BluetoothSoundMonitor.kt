@@ -1,0 +1,257 @@
+package com.example.soundstop
+
+import android.content.Context
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
+import kotlin.math.ln
+import kotlin.math.sqrt
+
+data class SoundInputDevice(
+    val id: Int,
+    val name: String,
+    val type: Int
+) {
+    val isBluetooth: Boolean
+        get() = type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            type == AudioDeviceInfo.TYPE_BLE_HEADSET
+
+    val isUsb: Boolean
+        get() = type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+
+    val connectionLabel: String
+        get() = if (isBluetooth) "Bluetooth" else "USB"
+}
+
+class BluetoothSoundMonitor(context: Context) {
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioManager = appContext.getSystemService(AudioManager::class.java)
+
+    fun availableInputs(): List<SoundInputDevice> = runCatching {
+        audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .filter { it.isSource && it.type in supportedInputTypes }
+            .map { device ->
+                SoundInputDevice(
+                    id = device.id,
+                    name = device.productName.toString().ifBlank { deviceTypeName(device.type) },
+                    type = device.type
+                )
+            }
+            .sortedWith(compareBy<SoundInputDevice> { !it.isUsb }.thenBy { it.name })
+    }.getOrDefault(emptyList())
+
+    @Volatile
+    private var active = false
+
+    @Volatile
+    private var recorder: AudioRecord? = null
+
+    private var worker: Thread? = null
+
+    fun start(
+        thresholdDbfs: Float,
+        holdDurationMs: Long,
+        selectedInputId: Int = -1,
+        onLevel: (Float, String) -> Unit,
+        onTriggered: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (active) return
+        active = true
+        worker = Thread {
+            monitor(selectedInputId, thresholdDbfs, holdDurationMs, onLevel, onTriggered, onError)
+        }.apply {
+            name = "BluetoothSoundMonitor"
+            start()
+        }
+    }
+
+    fun stop() {
+        active = false
+        runCatching { recorder?.stop() }
+        worker?.interrupt()
+    }
+
+    private fun monitor(
+        selectedInputId: Int,
+        thresholdDbfs: Float,
+        holdDurationMs: Long,
+        onLevel: (Float, String) -> Unit,
+        onTriggered: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val previousMode = audioManager.mode
+        val previousCommunicationDevice = audioManager.communicationDevice
+        var changedAudioMode = false
+        var changedCommunicationDevice = false
+        var localRecorder: AudioRecord? = null
+
+        try {
+            val inputDevice = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                .firstOrNull { it.id == selectedInputId && it.isSource && it.type in supportedInputTypes }
+                ?: audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                    .firstOrNull { it.isSource && it.type in supportedInputTypes }
+            if (inputDevice == null) {
+                reportError(onError, "USBまたはBluetoothのマイクが見つかりません。接続を確認してください。")
+                return
+            }
+
+            if (inputDevice.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                inputDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            ) {
+                val communicationDevice = audioManager.availableCommunicationDevices
+                    .firstOrNull {
+                        it.type == inputDevice.type &&
+                            it.productName.toString() == inputDevice.productName.toString()
+                    }
+                    ?: audioManager.availableCommunicationDevices.firstOrNull {
+                        it.type == inputDevice.type
+                    }
+                if (communicationDevice == null) {
+                    reportError(onError, "Bluetoothマイクの通話用音声経路が見つかりません。")
+                    return
+                }
+
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                changedAudioMode = true
+                if (!audioManager.setCommunicationDevice(communicationDevice)) {
+                    reportError(onError, "Bluetoothマイクへ切り替えられませんでした。")
+                    return
+                }
+                changedCommunicationDevice = true
+            }
+
+            val preferredRates = if (inputDevice.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                inputDevice.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                inputDevice.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+            ) listOf(48_000, 44_100, 16_000) else listOf(16_000, 24_000, 48_000)
+            val reportedRates = inputDevice.sampleRates.toSet()
+            val candidateRates = if (reportedRates.isEmpty()) {
+                preferredRates
+            } else {
+                preferredRates.filter { it in reportedRates } +
+                    (reportedRates - preferredRates.toSet()).sorted()
+            }
+            for (sampleRate in candidateRates) {
+                val minimumBufferSize = AudioRecord.getMinBufferSize(
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                )
+                if (minimumBufferSize <= 0) continue
+
+                val candidateRecorder = runCatching {
+                    AudioRecord.Builder()
+                        .setAudioSource(
+                            if (inputDevice.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                                inputDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                            ) MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                            else MediaRecorder.AudioSource.MIC
+                        )
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(maxOf(minimumBufferSize, sampleRate / 5 * 2))
+                        .build()
+                }.getOrNull()
+                if (candidateRecorder?.state == AudioRecord.STATE_INITIALIZED &&
+                    candidateRecorder.setPreferredDevice(inputDevice)
+                ) {
+                    localRecorder = candidateRecorder
+                    break
+                }
+                candidateRecorder?.release()
+            }
+
+            if (localRecorder == null) {
+                reportError(onError, "選択したマイクを開始できませんでした。別の入力機器を選んでください。")
+                return
+            }
+
+            recorder = localRecorder
+            localRecorder.startRecording()
+            val sampleRate = localRecorder.sampleRate
+            val samples = ShortArray(sampleRate / 50)
+            var loudSince = 0L
+
+            while (active) {
+                val count = localRecorder.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
+                if (count <= 0) {
+                    if (active) reportError(onError, "マイク入力を読み取れませんでした。")
+                    break
+                }
+
+                var energy = 0.0
+                for (index in 0 until count) {
+                    val sample = samples[index].toDouble()
+                    energy += sample * sample
+                }
+                val rms = sqrt(energy / count)
+                val levelDbfs = if (rms <= 0.0) -90f else
+                    (20.0 * ln(rms / 32768.0) / ln(10.0)).toFloat().coerceAtLeast(-90f)
+                val routedName = localRecorder.routedDevice?.productName?.toString()
+                    ?: inputDevice.productName.toString()
+                mainHandler.post { onLevel(levelDbfs, routedName) }
+
+                if (levelDbfs >= thresholdDbfs) {
+                    if (loudSince == 0L) loudSince = android.os.SystemClock.elapsedRealtime()
+                    if (android.os.SystemClock.elapsedRealtime() - loudSince >= holdDurationMs) {
+                        mainHandler.post(onTriggered)
+                        break
+                    }
+                } else {
+                    loudSince = 0L
+                }
+            }
+        } catch (_: SecurityException) {
+            reportError(onError, "マイクとBluetoothの権限が必要です。")
+        } catch (_: Exception) {
+            if (active) reportError(onError, "マイク入力を開始できませんでした。接続と権限を確認してください。")
+        } finally {
+            active = false
+            recorder = null
+            runCatching { localRecorder?.stop() }
+            localRecorder?.release()
+            if (changedCommunicationDevice) {
+                if (previousCommunicationDevice != null) {
+                    audioManager.setCommunicationDevice(previousCommunicationDevice)
+                } else {
+                    audioManager.clearCommunicationDevice()
+                }
+            }
+            if (changedAudioMode) audioManager.mode = previousMode
+        }
+    }
+
+    private fun reportError(onError: (String) -> Unit, message: String) {
+        if (active) mainHandler.post { onError(message) }
+    }
+
+    private fun deviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USBマイク"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetoothマイク"
+        else -> "外部マイク"
+    }
+
+    private companion object {
+        val supportedInputTypes = setOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_USB_DEVICE,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_USB_ACCESSORY
+        )
+    }
+}
