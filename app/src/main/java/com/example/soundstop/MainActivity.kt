@@ -32,6 +32,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -59,6 +60,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
+import kotlin.random.Random
 
 private val Paper = Color(0xFFF1F0E9)
 private val Ink = Color(0xFF19352C)
@@ -99,6 +101,9 @@ private fun SoundStopScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var isRunning by remember { mutableStateOf(false) }
+    var isWaiting by remember { mutableStateOf(false) }
+    var randomWaitEnabled by remember { mutableStateOf(false) }
+    var waitUntil by remember { mutableLongStateOf(0L) }
     var isStopped by remember { mutableStateOf(false) }
     var elapsedBeforeStart by remember { mutableLongStateOf(0L) }
     var startedAt by remember { mutableLongStateOf(0L) }
@@ -123,6 +128,7 @@ private fun SoundStopScreen(
 
     fun stopTimer(reason: String) {
         if (isRunning) elapsed = elapsedBeforeStart + (SystemClock.elapsedRealtime() - startedAt)
+        isWaiting = false
         isRunning = false
         isStopped = true
         message = reason
@@ -142,15 +148,13 @@ private fun SoundStopScreen(
         return true
     }
 
-    fun beginMonitoring() {
-        val input = selectedInput
-        if (input == null) {
-            message = "USBまたはBluetoothのマイクを接続してください"
-            return
-        }
+    fun startMonitoringNow(input: SoundInputDevice) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
-        ) return
+        ) {
+            message = "マイクの権限を許可してください"
+            return
+        }
 
         elapsedBeforeStart = 0L
         elapsed = 0L
@@ -180,6 +184,29 @@ private fun SoundStopScreen(
                 stopTimer(error)
             }
         )
+    }
+
+    fun beginMonitoring() {
+        val input = selectedInput
+        if (input == null) {
+            message = "USBまたはBluetoothのマイクを接続してください"
+            return
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return
+
+        if (randomWaitEnabled) {
+            elapsed = 0L
+            laps = emptyList()
+            lastLapElapsed = 0L
+            isStopped = false
+            waitUntil = SystemClock.elapsedRealtime() + Random.nextLong(1_000L, 5_001L)
+            isWaiting = true
+            return
+        }
+
+        startMonitoringNow(input)
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -226,10 +253,30 @@ private fun SoundStopScreen(
         }
     }
 
-    DisposableEffect(lifecycleOwner, isRunning) {
+    LaunchedEffect(isWaiting, waitUntil) {
+        if (!isWaiting) return@LaunchedEffect
+        while (isWaiting) {
+            val remainingMs = waitUntil - SystemClock.elapsedRealtime()
+            if (remainingMs <= 0L) break
+            message = "ランダム待機中 ${((remainingMs + 999L) / 1000L)}秒"
+            delay(minOf(remainingMs, 100L))
+        }
+        if (isWaiting) {
+            isWaiting = false
+            selectedInput?.let { startMonitoringNow(it) }
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, isRunning, isWaiting) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && isRunning) {
-                stopTimer("アプリを離れたため停止")
+            if (event == Lifecycle.Event.ON_STOP) {
+                when {
+                    isRunning -> stopTimer("アプリを離れたため停止")
+                    isWaiting -> {
+                        isWaiting = false
+                        message = "アプリを離れたため待機を中止しました"
+                    }
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -275,10 +322,14 @@ private fun SoundStopScreen(
                     Box(
                         Modifier
                             .size(8.dp)
-                            .background(if (isRunning) Signal else MutedInk, CircleShape)
+                            .background(if (isRunning) Signal else if (isWaiting) Accent else MutedInk, CircleShape)
                     )
                     Text(
-                        if (isRunning) "LIVE" else "READY",
+                        when {
+                            isRunning -> "LIVE"
+                            isWaiting -> "WAIT"
+                            else -> "READY"
+                        },
                         color = Ink,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold
@@ -381,7 +432,7 @@ private fun SoundStopScreen(
                         Box {
                             TextButton(
                                 onClick = { isInputMenuExpanded = true },
-                                enabled = !isRunning && inputDevices.isNotEmpty(),
+                                enabled = !isRunning && !isWaiting && inputDevices.isNotEmpty(),
                                 contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
                             ) {
                                 Text(
@@ -406,7 +457,7 @@ private fun SoundStopScreen(
                                             selectedInput = input
                                             isInputMenuExpanded = false
                                         },
-                                        enabled = !isRunning
+                                        enabled = !isRunning && !isWaiting
                                     )
                                 }
                             }
@@ -415,7 +466,7 @@ private fun SoundStopScreen(
                     Column(horizontalAlignment = Alignment.End) {
                         TextButton(
                             onClick = { refreshInputDevices() },
-                            enabled = !isRunning,
+                            enabled = !isRunning && !isWaiting,
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp, vertical = 0.dp)
                         ) {
                             Text("更新", color = Ink, fontSize = 12.sp)
@@ -437,7 +488,7 @@ private fun SoundStopScreen(
                     onValueChange = { threshold = it },
                     onValueChangeFinished = {},
                     valueRange = -90f..0f,
-                    enabled = !isRunning,
+                    enabled = !isRunning && !isWaiting,
                     colors = androidx.compose.material3.SliderDefaults.colors(
                         thumbColor = Accent,
                         activeTrackColor = Accent,
@@ -456,13 +507,28 @@ private fun SoundStopScreen(
                     onValueChange = { holdDurationMs = it.toLong() },
                     valueRange = 50f..1000f,
                     steps = 18,
-                    enabled = !isRunning,
+                    enabled = !isRunning && !isWaiting,
                     colors = androidx.compose.material3.SliderDefaults.colors(
                         thumbColor = Accent,
                         activeTrackColor = Accent,
                         inactiveTrackColor = Color(0xFFD5D8CF)
                     )
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("ランダム待機", color = Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("開始まで1〜5秒ランダムに待機", color = MutedInk, fontSize = 10.sp)
+                    }
+                    Switch(
+                        checked = randomWaitEnabled,
+                        onCheckedChange = { randomWaitEnabled = it },
+                        enabled = !isRunning && !isWaiting
+                    )
+                }
                 Text(
                     "閾値を下げると小さな音に反応し、時間を短くすると短い音でも停止します。",
                     color = MutedInk,
@@ -483,7 +549,7 @@ private fun SoundStopScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     TextButton(
                         onClick = { lapLimit = (lapLimit - 1).coerceAtLeast(1) },
-                        enabled = !isRunning && lapLimit > 1
+                        enabled = !isRunning && !isWaiting && lapLimit > 1
                     ) {
                         Text("−", color = Ink, fontSize = 20.sp)
                     }
@@ -496,7 +562,7 @@ private fun SoundStopScreen(
                     )
                     TextButton(
                         onClick = { lapLimit = (lapLimit + 1).coerceAtMost(10) },
-                        enabled = !isRunning && lapLimit < 10
+                        enabled = !isRunning && !isWaiting && lapLimit < 10
                     ) {
                         Text("+", color = Ink, fontSize = 20.sp)
                     }
@@ -512,16 +578,31 @@ private fun SoundStopScreen(
             ) {
                 Button(
                     onClick = {
-                        if (isRunning) stopTimer("手動で停止") else requestStart()
+                        when {
+                            isRunning -> stopTimer("手動で停止")
+                            isWaiting -> {
+                                isWaiting = false
+                                message = "待機を中止しました"
+                            }
+                            else -> requestStart()
+                        }
                     },
                     modifier = Modifier.weight(1f).height(58.dp),
                     shape = RoundedCornerShape(8.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isRunning) Ink else Accent,
+                        containerColor = if (isRunning || isWaiting) Ink else Accent,
                         contentColor = Color.White
                     )
                 ) {
-                    Text(if (isRunning) "停止する" else "計測を開始", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        when {
+                            isRunning -> "停止する"
+                            isWaiting -> "待機を中止"
+                            else -> "計測を開始"
+                        },
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
                 TextButton(
                     onClick = {
@@ -529,6 +610,7 @@ private fun SoundStopScreen(
                             if (recordLap() && isRunning) message = "ラップを記録しました"
                         } else {
                             soundMonitor.stop()
+                            isWaiting = false
                             isStopped = false
                             elapsedBeforeStart = 0L
                             elapsed = 0L

@@ -318,8 +318,17 @@ class BluetoothSoundMonitor(context: Context) {
                 val rms = sqrt(energy / count)
                 val levelDbfs = if (rms <= 0.0) -90f else
                     (20.0 * ln(rms / 32768.0) / ln(10.0)).toFloat().coerceAtLeast(-90f)
-                val routedName = inputDevice.productName.toString()
-                    .ifBlank { deviceTypeName(inputDevice.type) }
+                val routedName = if (isBluetoothInput) {
+                    audioManager.communicationDevice?.productName?.toString()
+                        ?.takeIf { it.isNotBlank() }
+                        ?: recordingRecorder.routedDevice?.productName?.toString()
+                            ?.takeIf { it.isNotBlank() }
+                        ?: "Bluetoothマイク"
+                } else {
+                    recordingRecorder.routedDevice?.productName?.toString()
+                        ?.takeIf { it.isNotBlank() }
+                        ?: inputDevice.productName.toString().ifBlank { deviceTypeName(inputDevice.type) }
+                }
                 mainHandler.post {
                     if (isSessionActive(currentSession)) onLevel(levelDbfs, routedName)
                 }
