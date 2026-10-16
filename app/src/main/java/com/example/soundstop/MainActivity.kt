@@ -39,6 +39,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -65,6 +66,12 @@ private val MutedInk = Color(0xFF718078)
 private val Accent = Color(0xFFE66A45)
 private val Signal = Color(0xFFB5D95C)
 private val Panel = Color(0xFF19352C)
+
+private data class LapRecord(
+    val number: Int,
+    val durationMs: Long,
+    val totalElapsedMs: Long
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -96,6 +103,9 @@ private fun SoundStopScreen(
     var elapsedBeforeStart by remember { mutableLongStateOf(0L) }
     var startedAt by remember { mutableLongStateOf(0L) }
     var elapsed by remember { mutableLongStateOf(0L) }
+    var lapLimit by remember { mutableIntStateOf(10) }
+    var laps by remember { mutableStateOf(emptyList<LapRecord>()) }
+    var lastLapElapsed by remember { mutableLongStateOf(0L) }
     var threshold by remember { mutableFloatStateOf(-45f) }
     var holdDurationMs by remember { mutableLongStateOf(300L) }
     var level by remember { mutableFloatStateOf(-90f) }
@@ -119,6 +129,19 @@ private fun SoundStopScreen(
         soundMonitor.stop()
     }
 
+    fun recordLap(): Boolean {
+        if (!isRunning || laps.size >= lapLimit) return false
+        val totalElapsed = elapsedBeforeStart + (SystemClock.elapsedRealtime() - startedAt)
+        laps = laps + LapRecord(
+            number = laps.size + 1,
+            durationMs = totalElapsed - lastLapElapsed,
+            totalElapsedMs = totalElapsed
+        )
+        lastLapElapsed = totalElapsed
+        if (laps.size >= lapLimit) stopTimer("ラップ上限に達したため停止")
+        return true
+    }
+
     fun beginMonitoring() {
         val input = selectedInput
         if (input == null) {
@@ -131,10 +154,13 @@ private fun SoundStopScreen(
 
         elapsedBeforeStart = 0L
         elapsed = 0L
+        laps = emptyList()
+        lastLapElapsed = 0L
         startedAt = SystemClock.elapsedRealtime()
         isStopped = false
         isRunning = true
         level = -90f
+        micName = "接続確認中"
         message = "音を待っています"
         soundMonitor.start(
             thresholdDbfs = threshold,
@@ -144,8 +170,15 @@ private fun SoundStopScreen(
                 level = nextLevel
                 micName = deviceName
             },
-            onTriggered = { stopTimer("音を検知して停止") },
-            onError = { error -> stopTimer(error) }
+            onTriggered = {
+                if (recordLap() && isRunning) {
+                    message = "音を検知してラップ記録・計測継続中"
+                }
+            },
+            onError = { error ->
+                micName = "未接続"
+                stopTimer(error)
+            }
         )
     }
 
@@ -260,14 +293,6 @@ private fun SoundStopScreen(
                     .padding(horizontal = 22.dp, vertical = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("ELAPSED TIME", color = Color(0xFFB9C8BF), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                    Text("${formatHundredths(elapsed)}", color = Signal, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
-                }
                 Text(
                     formatClock(elapsed),
                     color = Color(0xFFF5F2E9),
@@ -280,6 +305,65 @@ private fun SoundStopScreen(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Box(Modifier.size(7.dp).background(if (isRunning) Signal else Accent, CircleShape))
                     Text(message, color = Color(0xFFD5DED8), fontSize = 13.sp)
+                }
+            }
+
+            if (laps.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White.copy(alpha = 0.75f), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("ラップ記録", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            if (isRunning) "${laps.size} / $lapLimit" else "${laps.size}件",
+                            color = MutedInk,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("回数", color = MutedInk, fontSize = 10.sp)
+                        Text("区間", color = MutedInk, fontSize = 10.sp)
+                        Text("累計", color = MutedInk, fontSize = 10.sp)
+                    }
+                    laps.forEach { lap ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "LAP %02d".format(lap.number),
+                                color = MutedInk,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                formatClock(lap.durationMs),
+                                color = Ink,
+                                fontSize = 14.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                formatClock(lap.totalElapsedMs),
+                                color = MutedInk,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
                 }
             }
 
@@ -387,6 +471,38 @@ private fun SoundStopScreen(
                 )
             }
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("ラップ上限", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("1〜10件で設定", color = MutedInk, fontSize = 10.sp)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(
+                        onClick = { lapLimit = (lapLimit - 1).coerceAtLeast(1) },
+                        enabled = !isRunning && lapLimit > 1
+                    ) {
+                        Text("−", color = Ink, fontSize = 20.sp)
+                    }
+                    Text(
+                        "${lapLimit}件",
+                        color = Ink,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    TextButton(
+                        onClick = { lapLimit = (lapLimit + 1).coerceAtMost(10) },
+                        enabled = !isRunning && lapLimit < 10
+                    ) {
+                        Text("+", color = Ink, fontSize = 20.sp)
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(4.dp))
 
             Row(
@@ -409,24 +525,37 @@ private fun SoundStopScreen(
                 }
                 TextButton(
                     onClick = {
-                        soundMonitor.stop()
-                        isRunning = false
-                        isStopped = false
-                        elapsedBeforeStart = 0L
-                        elapsed = 0L
-                        level = -90f
-                        micName = "未接続"
-                        message = "入力機器を選択して計測を開始"
+                        if (isRunning) {
+                            if (recordLap() && isRunning) message = "ラップを記録しました"
+                        } else {
+                            soundMonitor.stop()
+                            isStopped = false
+                            elapsedBeforeStart = 0L
+                            elapsed = 0L
+                            laps = emptyList()
+                            lastLapElapsed = 0L
+                            level = -90f
+                            micName = "未接続"
+                            message = "入力機器を選択して計測を開始"
+                        }
                     },
-                    enabled = !isRunning,
+                    enabled = if (isRunning) laps.size < lapLimit else true,
                     modifier = Modifier.height(54.dp)
                 ) {
-                    Text("リセット", color = if (isRunning) MutedInk else Ink, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        when {
+                            isRunning && laps.size >= lapLimit -> "上限到達"
+                            isRunning -> "ラップ"
+                            else -> "リセット"
+                        },
+                        color = if (isRunning && laps.size >= lapLimit) MutedInk else Ink,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
             if (isStopped) {
                 Text(
-                    "計測結果  ${formatClock(elapsed)}.${(elapsed % 1000 / 10).toString().padStart(2, '0')}",
+                    "計測結果  ${formatClock(elapsed)}",
                     modifier = Modifier.align(Alignment.End),
                     color = MutedInk,
                     fontSize = 11.sp,
@@ -461,12 +590,10 @@ private fun formatClock(milliseconds: Long): String {
     val hours = totalSeconds / 3600
     val minutes = (totalSeconds % 3600) / 60
     val seconds = totalSeconds % 60
+    val hundredths = milliseconds % 1000 / 10
     return if (hours > 0) {
-        "%02d:%02d:%02d".format(hours, minutes, seconds)
+        "%02d:%02d:%02d.%02d".format(hours, minutes, seconds, hundredths)
     } else {
-        "%02d:%02d".format(minutes, seconds)
+        "%02d:%02d.%02d".format(minutes, seconds, hundredths)
     }
 }
-
-private fun formatHundredths(milliseconds: Long): String =
-    ".%02d".format(milliseconds % 1000 / 10)
