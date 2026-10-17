@@ -2,6 +2,7 @@ package com.example.soundstop
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.MediaPlayer
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.WindowManager
@@ -102,6 +103,7 @@ private fun SoundStopScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     var isRunning by remember { mutableStateOf(false) }
     var isWaiting by remember { mutableStateOf(false) }
+    var isRandomWaiting by remember { mutableStateOf(false) }
     var randomWaitEnabled by remember { mutableStateOf(false) }
     var waitUntil by remember { mutableLongStateOf(0L) }
     var isStopped by remember { mutableStateOf(false) }
@@ -118,8 +120,8 @@ private fun SoundStopScreen(
     var inputDevices by remember { mutableStateOf(emptyList<SoundInputDevice>()) }
     var selectedInput by remember { mutableStateOf<SoundInputDevice?>(null) }
     var isInputMenuExpanded by remember { mutableStateOf(false) }
+    var startSoundPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var message by remember { mutableStateOf("入力機器を選択して計測を開始") }
-
     fun refreshInputDevices() {
         inputDevices = soundMonitor.availableInputs()
         selectedInput = inputDevices.firstOrNull { it.id == selectedInput?.id }
@@ -186,6 +188,49 @@ private fun SoundStopScreen(
         )
     }
 
+    fun releaseStartCue() {
+        startSoundPlayer?.let { player ->
+            startSoundPlayer = null
+            runCatching {
+                player.setOnCompletionListener(null)
+                player.setOnErrorListener(null)
+                if (player.isPlaying) player.stop()
+                player.release()
+            }
+        }
+    }
+
+    fun finishStartCue(input: SoundInputDevice) {
+        releaseStartCue()
+        if (isWaiting) {
+            isWaiting = false
+            startMonitoringNow(input)
+        }
+    }
+
+    fun playStartCue(input: SoundInputDevice) {
+        isWaiting = true
+        message = "スタート音を再生中"
+        val player = MediaPlayer.create(context, R.raw.start_beep)
+        if (player == null) {
+            finishStartCue(input)
+            return
+        }
+        startSoundPlayer = player
+        player.setOnCompletionListener { finishStartCue(input) }
+        player.setOnErrorListener { _, _, _ ->
+            finishStartCue(input)
+            true
+        }
+        runCatching { player.start() }.onFailure { finishStartCue(input) }
+    }
+
+    fun cancelStartCue() {
+        isWaiting = false
+        isRandomWaiting = false
+        releaseStartCue()
+    }
+
     fun beginMonitoring() {
         val input = selectedInput
         if (input == null) {
@@ -203,10 +248,11 @@ private fun SoundStopScreen(
             isStopped = false
             waitUntil = SystemClock.elapsedRealtime() + Random.nextLong(1_000L, 5_001L)
             isWaiting = true
+            isRandomWaiting = true
             return
         }
 
-        startMonitoringNow(input)
+        playStartCue(input)
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -253,17 +299,16 @@ private fun SoundStopScreen(
         }
     }
 
-    LaunchedEffect(isWaiting, waitUntil) {
-        if (!isWaiting) return@LaunchedEffect
-        while (isWaiting) {
+    LaunchedEffect(isRandomWaiting, waitUntil) {
+        if (!isRandomWaiting) return@LaunchedEffect
+        while (isRandomWaiting) {
             val remainingMs = waitUntil - SystemClock.elapsedRealtime()
             if (remainingMs <= 0L) break
             message = "ランダム待機中 ${((remainingMs + 999L) / 1000L)}秒"
             delay(minOf(remainingMs, 100L))
         }
-        if (isWaiting) {
-            isWaiting = false
-            selectedInput?.let { startMonitoringNow(it) }
+        if (isRandomWaiting) {
+            selectedInput?.let { playStartCue(it) } ?: cancelStartCue()
         }
     }
 
@@ -273,7 +318,7 @@ private fun SoundStopScreen(
                 when {
                     isRunning -> stopTimer("アプリを離れたため停止")
                     isWaiting -> {
-                        isWaiting = false
+                        cancelStartCue()
                         message = "アプリを離れたため待機を中止しました"
                     }
                 }
@@ -359,6 +404,80 @@ private fun SoundStopScreen(
                 }
             }
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        when {
+                            isRunning -> stopTimer("手動で停止")
+                            isWaiting -> {
+                                cancelStartCue()
+                                message = "待機を中止しました"
+                            }
+                            else -> requestStart()
+                        }
+                    },
+                    modifier = Modifier.weight(1f).height(58.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isRunning || isWaiting) Ink else Accent,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Text(
+                        when {
+                            isRunning -> "停止する"
+                            isWaiting -> "待機を中止"
+                            else -> "計測を開始"
+                        },
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                TextButton(
+                    onClick = {
+                        if (isRunning) {
+                            if (recordLap() && isRunning) message = "ラップを記録しました"
+                        } else {
+                            cancelStartCue()
+                            soundMonitor.stop()
+                            isStopped = false
+                            elapsedBeforeStart = 0L
+                            elapsed = 0L
+                            laps = emptyList()
+                            lastLapElapsed = 0L
+                            level = -90f
+                            micName = "未接続"
+                            message = "入力機器を選択して計測を開始"
+                        }
+                    },
+                    enabled = if (isRunning) laps.size < lapLimit else true,
+                    modifier = Modifier.height(54.dp)
+                ) {
+                    Text(
+                        when {
+                            isRunning && laps.size >= lapLimit -> "上限到達"
+                            isRunning -> "ラップ"
+                            else -> "リセット"
+                        },
+                        color = if (isRunning && laps.size >= lapLimit) MutedInk else Ink,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            if (isStopped) {
+                Text(
+                    "計測結果  ${formatClock(elapsed)}",
+                    modifier = Modifier.align(Alignment.End),
+                    color = MutedInk,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
             if (laps.isNotEmpty()) {
                 Column(
                     modifier = Modifier
@@ -419,6 +538,7 @@ private fun SoundStopScreen(
             }
 
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("計測設定", color = MutedInk, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -514,6 +634,12 @@ private fun SoundStopScreen(
                         inactiveTrackColor = Color(0xFFD5D8CF)
                     )
                 )
+                Text(
+                    "閾値を下げると小さな音に反応し、時間を短くすると短い音でも停止します。",
+                    color = MutedInk,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -529,121 +655,40 @@ private fun SoundStopScreen(
                         enabled = !isRunning && !isWaiting
                     )
                 }
-                Text(
-                    "閾値を下げると小さな音に反応し、時間を短くすると短い音でも停止します。",
-                    color = MutedInk,
-                    fontSize = 11.sp,
-                    lineHeight = 16.sp
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("ラップ上限", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                    Text("1〜10件で設定", color = MutedInk, fontSize = 10.sp)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(
-                        onClick = { lapLimit = (lapLimit - 1).coerceAtLeast(1) },
-                        enabled = !isRunning && !isWaiting && lapLimit > 1
-                    ) {
-                        Text("−", color = Ink, fontSize = 20.sp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("ラップ上限", color = Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("1〜10件", color = MutedInk, fontSize = 10.sp)
                     }
-                    Text(
-                        "${lapLimit}件",
-                        color = Ink,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    TextButton(
-                        onClick = { lapLimit = (lapLimit + 1).coerceAtMost(10) },
-                        enabled = !isRunning && !isWaiting && lapLimit < 10
-                    ) {
-                        Text("+", color = Ink, fontSize = 20.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(
+                            onClick = { lapLimit = (lapLimit - 1).coerceAtLeast(1) },
+                            enabled = !isRunning && !isWaiting && lapLimit > 1
+                        ) {
+                            Text("−", color = Ink, fontSize = 20.sp)
+                        }
+                        Text(
+                            "${lapLimit}件",
+                            color = Ink,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        TextButton(
+                            onClick = { lapLimit = (lapLimit + 1).coerceAtMost(10) },
+                            enabled = !isRunning && !isWaiting && lapLimit < 10
+                        ) {
+                            Text("+", color = Ink, fontSize = 20.sp)
+                        }
                     }
                 }
             }
 
             Spacer(modifier = Modifier.height(4.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Button(
-                    onClick = {
-                        when {
-                            isRunning -> stopTimer("手動で停止")
-                            isWaiting -> {
-                                isWaiting = false
-                                message = "待機を中止しました"
-                            }
-                            else -> requestStart()
-                        }
-                    },
-                    modifier = Modifier.weight(1f).height(58.dp),
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isRunning || isWaiting) Ink else Accent,
-                        contentColor = Color.White
-                    )
-                ) {
-                    Text(
-                        when {
-                            isRunning -> "停止する"
-                            isWaiting -> "待機を中止"
-                            else -> "計測を開始"
-                        },
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-                TextButton(
-                    onClick = {
-                        if (isRunning) {
-                            if (recordLap() && isRunning) message = "ラップを記録しました"
-                        } else {
-                            soundMonitor.stop()
-                            isWaiting = false
-                            isStopped = false
-                            elapsedBeforeStart = 0L
-                            elapsed = 0L
-                            laps = emptyList()
-                            lastLapElapsed = 0L
-                            level = -90f
-                            micName = "未接続"
-                            message = "入力機器を選択して計測を開始"
-                        }
-                    },
-                    enabled = if (isRunning) laps.size < lapLimit else true,
-                    modifier = Modifier.height(54.dp)
-                ) {
-                    Text(
-                        when {
-                            isRunning && laps.size >= lapLimit -> "上限到達"
-                            isRunning -> "ラップ"
-                            else -> "リセット"
-                        },
-                        color = if (isRunning && laps.size >= lapLimit) MutedInk else Ink,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-            }
-            if (isStopped) {
-                Text(
-                    "計測結果  ${formatClock(elapsed)}",
-                    modifier = Modifier.align(Alignment.End),
-                    color = MutedInk,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace
-                )
-            }
         }
     }
 }
