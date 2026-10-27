@@ -46,6 +46,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -61,6 +62,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.random.Random
 
 private val Paper = Color(0xFFF1F0E9)
@@ -122,10 +124,24 @@ private fun SoundStopScreen(
     var isInputMenuExpanded by remember { mutableStateOf(false) }
     var startSoundPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var message by remember { mutableStateOf("入力機器を選択して計測を開始") }
+    val coroutineScope = rememberCoroutineScope()
+
     fun refreshInputDevices() {
         inputDevices = soundMonitor.availableInputs()
         selectedInput = inputDevices.firstOrNull { it.id == selectedInput?.id }
             ?: inputDevices.firstOrNull()
+    }
+
+    fun startTimerClock() {
+        elapsedBeforeStart = 0L
+        elapsed = 0L
+        laps = emptyList()
+        lastLapElapsed = 0L
+        startedAt = SystemClock.elapsedRealtime()
+        isStopped = false
+        isRunning = true
+        level = -90f
+        micName = "接続確認中"
     }
 
     fun stopTimer(reason: String) {
@@ -150,7 +166,7 @@ private fun SoundStopScreen(
         return true
     }
 
-    fun startMonitoringNow(input: SoundInputDevice) {
+    fun startMonitoringNow(input: SoundInputDevice, onReady: (() -> Unit)? = null) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -158,16 +174,8 @@ private fun SoundStopScreen(
             return
         }
 
-        elapsedBeforeStart = 0L
-        elapsed = 0L
-        laps = emptyList()
-        lastLapElapsed = 0L
-        startedAt = SystemClock.elapsedRealtime()
-        isStopped = false
-        isRunning = true
-        level = -90f
-        micName = "接続確認中"
-        message = "音を待っています"
+        var readinessCallback = onReady
+        message = "入力経路を準備中"
         soundMonitor.start(
             thresholdDbfs = threshold,
             holdDurationMs = holdDurationMs,
@@ -175,9 +183,15 @@ private fun SoundStopScreen(
             onLevel = { nextLevel, deviceName ->
                 level = nextLevel
                 micName = deviceName
+                if (isWaiting && !isRunning) {
+                    readinessCallback?.let { callback ->
+                        readinessCallback = null
+                        callback()
+                    }
+                }
             },
             onTriggered = {
-                if (recordLap() && isRunning) {
+                if (!isWaiting && recordLap() && isRunning) {
                     message = "音を検知してラップ記録・計測継続中"
                 }
             },
@@ -204,14 +218,16 @@ private fun SoundStopScreen(
         releaseStartCue()
         if (isWaiting) {
             isWaiting = false
-            startMonitoringNow(input)
+            if (!isRunning) startTimerClock()
+            message = "音を待っています"
         }
     }
 
     fun playStartCue(input: SoundInputDevice) {
         isWaiting = true
-        message = "スタート音を再生中"
-        val player = MediaPlayer.create(context, R.raw.start_beep)
+        isRandomWaiting = false
+        message = ""
+        val player = MediaPlayer.create(context, R.raw.start_whistle)
         if (player == null) {
             finishStartCue(input)
             return
@@ -222,13 +238,28 @@ private fun SoundStopScreen(
             finishStartCue(input)
             true
         }
-        runCatching { player.start() }.onFailure { finishStartCue(input) }
+        runCatching {
+            player.start()
+            coroutineScope.launch {
+                delay(100L)
+                if (isWaiting && !isRunning) startTimerClock()
+            }
+        }.onFailure { finishStartCue(input) }
+    }
+
+    fun prepareStartCue(input: SoundInputDevice) {
+        isWaiting = true
+        isRandomWaiting = false
+        startMonitoringNow(input) {
+            if (isWaiting && !isRunning && startSoundPlayer == null) playStartCue(input)
+        }
     }
 
     fun cancelStartCue() {
         isWaiting = false
         isRandomWaiting = false
         releaseStartCue()
+        soundMonitor.stop()
     }
 
     fun beginMonitoring() {
@@ -246,13 +277,18 @@ private fun SoundStopScreen(
             laps = emptyList()
             lastLapElapsed = 0L
             isStopped = false
-            waitUntil = SystemClock.elapsedRealtime() + Random.nextLong(1_000L, 5_001L)
             isWaiting = true
-            isRandomWaiting = true
+            isRandomWaiting = false
+            startMonitoringNow(input) {
+                if (isWaiting && !isRunning) {
+                    waitUntil = SystemClock.elapsedRealtime() + Random.nextLong(2_000L, 5_001L)
+                    isRandomWaiting = true
+                }
+            }
             return
         }
 
-        playStartCue(input)
+        prepareStartCue(input)
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -647,7 +683,7 @@ private fun SoundStopScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("ランダム待機", color = Ink, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        Text("開始まで1〜5秒ランダムに待機", color = MutedInk, fontSize = 10.sp)
+                        Text("開始まで2〜5秒ランダムに待機", color = MutedInk, fontSize = 10.sp)
                     }
                     Switch(
                         checked = randomWaitEnabled,
